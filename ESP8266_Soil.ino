@@ -3,40 +3,68 @@
  * The ESP8266/ESP-12E SCL pin is D1 (GPIO5), and SDA is D2 (GPIO4).
  * @copyright   Copyright © 2022 Adam Howell
  * @licence     The MIT License (MIT)
+ *
+ * Pseudocode:
+ * 1. Read the soil moisture level (capacitance) every sensorPollDelay.
+ * 2. Read the temperature from the soil moisture sensor.
+ * 3. If moisture is less than minMoisture, run pump for pumpRunTime.
+ * The pump is run in pumpRunTime millisecond increments instead of waiting for the reading to get above the minimum level.  Waiting could result in overwatering.
+ * If the moisture level is still low after pumpRunTime millisectonds, it will trigger again during the next loop() after pumpMinOffDelay milliseconds has passed.
+ *
+ * Publish:
+ * 	every time the pump runs: soilMoisture and soilTempC
+ * 	every publishDelay: all stats (soilMoisture, soilTempC, loopCount, etc.)
  */
-#include <ESP8266WiFi.h>			// This header is part of the standard library.  https://www.arduino.cc/en/Reference/WiFi
+#include "ESP8266WiFi.h"			// This header is part of the standard library.  https://www.arduino.cc/en/Reference/WiFi
 #include <Wire.h>						// This header is part of the standard library.  https://www.arduino.cc/en/reference/wire
 #include <PubSubClient.h>			// PubSub is the MQTT API.  Author: Nick O'Leary  https://github.com/knolleary/pubsubclient
-#include "privateInfo.h"			// I use this file to hide my network information from random people browsing my GitHub repo.
-#include "Adafruit_seesaw.h"		// Used to read the soil sensor.
+#include "privateInfo.h"			// This file holds my network credentials and addresses of servers.
+#include "Adafruit_seesaw.h"		// Used to read the soil sensor. https://github.com/adafruit/Adafruit_Seesaw - Requires https://github.com/adafruit/Adafruit_BusIO
 #include <ArduinoJson.h>			// https://arduinojson.org/
 
 /**
  * The commented-out variables are stored in "privateInfo.h", which I do not upload to GitHub.
- * If you do not want to use that file, you can set them here instead.
+ * If you do not want to create that file, set them here instead.
  */
 //const char* wifiSsid = "your WiFi SSID";
 //const char* wifiPassword = "your WiFi password";
 //const char* mqttBroker = "your broker address";
 //const int mqttPort = 1883;
-const char* mqttTopic = "espWeather";								// The topic to publish to.
-const char* commandTopic = "backYard/Lolin8266/command";		// This is a topic we subscribe to, to get updates.  Updates may change publishDelay or request an immediate poll of the sensors.
-const char* sketchName = "ESP8266_Soil";
-const char* notes = "Lolin ESP8266 with Adafruit I2C soil sensor";
-const int LED_PIN = 2;											// This LED for the Lolin devkit is on the ESP8266 module itself (next to the antenna).
-const int sdaGPIO = 5;
-const int sclGPIO = 4;
-char ipAddress[16];
-char macAddress[18];
+const char * sketchName = "ESP8266_Soil";
+const char * notes = "Lolin ESP8266 with Adafruit I2C soil sensor";
+const char * commandTopic = "backYard/Lolin8266/command";         // The topic used to subscribe to update commands.  Commands: publishTelemetry, changeTelemetryInterval, publishStatus.
+const char * sketchTopic = "backYard/Lolin8266/sketch";           // The topic used to publish the sketch name.
+const char * macTopic = "backYard/Lolin8266/mac";                 // The topic used to publish the MAC address.
+const char * ipTopic = "backYard/Lolin8266/ip";                   // The topic used to publish the IP address.
+const char * rssiTopic = "backYard/Lolin8266/rssi";               // The topic used to publish the WiFi Received Signal Strength Indicator.
+const char * loopCountTopic = "backYard/Lolin8266/loopCount";     // The topic used to publish the loop count.
+const char * notesTopic = "backYard/Lolin8266/notes";             // The topic used to publish notes relevant to this project.
+const char * tempCTopic = "backYard/Lolin8266/soil/tempC";        // The topic used to publish the soil temperature.
+const char * moistureTopic = "backYard/Lolin8266/soil/moisture";  // The topic used to publish the soil moisture.
+const char * mqttTopic = "espWeather";                            // The topic used to publish a single JSON message containing all data.
+char ipAddress[16];												// The IP address.
+char macAddress[18];												// The MAC address to use as part of the MQTT client ID.
+const unsigned int LED_PIN = 2;								// This LED for the Lolin devkit is on the ESP8266 module itself (next to the antenna).
+const unsigned int sdaGPIO = 5;								// The GPIO to use for SDA.
+const unsigned int sclGPIO = 4;								// The GPIO to use for SCL.
+const unsigned int relayGPIO = 14;							// The GPIO which controls the relay.
+unsigned int mqttReconnectDelay = 5000;					// How long to wait (in milliseconds) between MQTT connection attempts.
 unsigned int loopCount = 0;									// This is a counter for how many loops have happened since power-on (or overflow).
 unsigned long publishDelay = 60000;							// This is the delay between MQTT publishes.
-unsigned long sensorPollDelay = 4000;						// This is the delay between polls of the soil sensor.  This should be greater than 100 milliseconds.
-int mqttReconnectDelay = 5000;								// How long to wait (in milliseconds) between MQTT connection attempts.
-unsigned long lastPublish = 0;								// This is used to determine the time since last MQTT publish.
-unsigned long lastPoll = 0;									// This is used to determine the time since last sensor poll.
-unsigned long bootTime;											// The time since boot.  This value "rolls" at about 50 days.
-float soilTempC = 0.0;
-uint16_t soilCapacitance = 0;
+unsigned long sensorPollDelay = 10000;						// This is the delay between polls of the soil sensor.  This should be greater than 100 milliseconds.
+unsigned long pumpRunTime = 20000;							// Minimum time to run the pump.
+unsigned long pumpMinOffDelay = 20000;						// The time to wait after stopping, before the pump will start again.  This allows water to flow through the soil.
+unsigned long lastPublishTime = 0;							// This is used to determine the time since last MQTT publish.
+unsigned long lastPollTime = 0;								// This is used to determine the time since last sensor poll.
+unsigned long bootTime = 0;									// The time since boot.  This value "rolls" at about 50 days.
+unsigned long pumpStartTime = 0;								// The most recent time that the pump started.
+unsigned long pumpStopTime = 0;								// The most recent time that the pump stopped.
+bool pumpRunning = false;										// Flag to indicate when the pump is running or not.
+bool invalidTemp = false;										// Flag to indicate the last reading was out of boundaries.
+bool invalidMoisture = false;									// Flag to indicate the last reading was out of boundaries.
+float soilTempC = 0.0;											// The soil temperature in Celcius.
+uint16_t soilMoisture = 0;										// The soil moisture level (capacitance).
+uint16_t minMoisture = 500;									// The moisture level which triggers the pump.
 
 
 // Create class objects.
@@ -45,7 +73,7 @@ PubSubClient mqttClient( espClient );
 Adafruit_seesaw soilSensor;
 
 
-void onReceiveCallback( char* topic, byte* payload, unsigned int length )
+void onReceiveCallback( char * topic, byte * payload, unsigned int length )
 {
 	char str[length + 1];
 	Serial.print( "Message arrived [" );
@@ -58,12 +86,13 @@ void onReceiveCallback( char* topic, byte* payload, unsigned int length )
 		str[i] = ( char )payload[i];
 	}
 	Serial.println();
-	str[i] = 0; // Null termination
+	// Add the null terminator.
+	str[i] = 0;
 	StaticJsonDocument <256> doc;
 	deserializeJson( doc, str );
 
-	// The command can be: publishTelemetry, changeTelemetryInterval, changeSeaLevelPressure, or publishStatus.
-	const char* command = doc["command"];
+	// The command can be: publishTelemetry, changeTelemetryInterval, or publishStatus.
+	const char * command = doc["command"];
 	if( strcmp( command, "publishTelemetry") == 0 )
 	{
 		Serial.println( "Reading and publishing sensor values." );
@@ -82,7 +111,7 @@ void onReceiveCallback( char* topic, byte* payload, unsigned int length )
 			publishDelay = tempValue;
 		Serial.print( "MQTT publish interval has been updated to " );
 		Serial.println( publishDelay );
-		lastPublish = 0;
+		lastPublishTime = 0;
 	}
 	else if( strcmp( command, "publishStatus") == 0 )
 	{
@@ -96,19 +125,71 @@ void onReceiveCallback( char* topic, byte* payload, unsigned int length )
 } // End of onReceiveCallback() function.
 
 
+/*
+ * This function will reset the device.
+ * It declares a reset function at address 0.
+ * ToDo: Currently, this does not work.
+ */
+void(* resetFunc) (void) = 0;
+
+
+/*
+ * readTelemetry() will:
+ * 1. read from all available sensors
+ * 2. store legitimate values in global variables
+ * 3. set a flag if any value is invalid
+ */
 void readTelemetry()
 {
-	soilTempC = soilSensor.getTemp();
-	soilCapacitance = soilSensor.touchRead( 0 );
+	float temporarySoilTempC = soilSensor.getTemp();
+	uint16_t temporarySoilMoisture = soilSensor.touchRead( 0 );
+
+	// Ignore obviously invalid temperature readings.
+	if( temporarySoilTempC > -50 || temporarySoilTempC < 90 )
+	{
+		soilTempC = temporarySoilTempC;
+		invalidTemp = false;
+	}
+	else
+	{
+		// If this is already true, meaning two polls in a row were bad, reboot the device.
+		if( invalidTemp == true )
+		{
+			Serial.println("\n\n\n\nTwo consecutive bad values!\nResetting the device!\n\n");
+			resetFunc();	// Call the reset function.
+		}
+		else
+			invalidTemp = true;
+	}
+
+	// Ignore obviously invalid moisture readings.
+	if( temporarySoilMoisture > 100 || temporarySoilMoisture < 1500 )
+	{
+		soilMoisture = temporarySoilMoisture;
+		invalidMoisture = false;
+	}
+	else
+	{
+		// If this is already true, meaning two polls in a row were bad, reboot the device.
+		if( invalidMoisture == true )
+		{
+			Serial.println("\n\n\n\nTwo consecutive bad values!\nResetting the device!\n\n");
+			resetFunc();	// Call the reset function.
+		}
+		else
+			invalidMoisture = true;
+	}
 }
 
 
+/*
+ * wifiConnect() will attempt to connect to the defined WiFi network up to maxAttempts times.
+ */
 void wifiConnect( int maxAttempts )
 {
 	// Announce WiFi parameters.
-	String logString = "WiFi connecting to SSID: ";
-	logString += wifiSsid;
-	Serial.println( logString );
+	Serial.print( "WiFi connecting to SSID: " );
+	Serial.println( wifiSsid );
 
 	// Connect to the WiFi network.
 	Serial.printf( "Wi-Fi mode set to WIFI_STA %s\n", WiFi.mode( WIFI_STA ) ? "" : " - Failed!" );
@@ -202,9 +283,9 @@ bool mqttConnect( int maxAttempts )
 		// Subscribe to backYard/Lolin8266/command, which will respond to publishTelemetry and publishStatus
 		mqttClient.subscribe( commandTopic );
 		mqttClient.setBufferSize( 512 );
-		char mqttString[512];
-		snprintf( mqttString, 512, "{\n\t\"sketch\": \"%s\",\n\t\"mac\": \"%s\",\n\t\"ip\": \"%s\"\n}", sketchName, macAddress, ipAddress );
-		mqttClient.publish( "espConnect", mqttString );
+		char connectString[512];
+		snprintf( connectString, 512, "{\n\t\"sketch\": \"%s\",\n\t\"mac\": \"%s\",\n\t\"ip\": \"%s\"\n}", sketchName, macAddress, ipAddress );
+		mqttClient.publish( "espConnect", connectString );
 		digitalWrite( LED_PIN, 0 ); // Turn the LED on.
 	}
 	else
@@ -218,6 +299,9 @@ bool mqttConnect( int maxAttempts )
 } // End of mqttConnect() function.
 
 
+/*
+ * setup() will initialize the device and connected components.
+ */
 void setup()
 {
 	delay( 500 );								// A pause to give me time to open the serial monitor.
@@ -233,6 +317,9 @@ void setup()
 	Serial.print( sketchName );
 	Serial.println( " is beginning its setup()." );
 	Serial.println( __FILE__ );
+
+	pinMode( relayGPIO, OUTPUT );			// Set the replay (pump) GPIO as an output.
+	digitalWrite( relayGPIO, LOW );		// Turn the relay (pump) off.
 
 	// Set the ipAddress char array to a default value.
 	snprintf( ipAddress, 16, "127.0.0.1" );
@@ -255,12 +342,15 @@ void setup()
 	Serial.print( "MAC address: " );
 	Serial.println( macAddress );
 
-	wifiConnect( 20 );
+	wifiConnect( 5 );
 
 	printUptime();
 } // End of setup() function.
 
 
+/*
+ * printUptime() will print the uptime to the serial port.
+ */
 void printUptime()
 {
 	Serial.print( "Uptime in " );
@@ -285,21 +375,11 @@ void printUptime()
 } // End of printUptime() function.
 
 
+/*
+ * publishTelemetry() will publish the sensor and device data over MQTT.
+ */
 void publishTelemetry()
 {
-	// New format: <location>/<device>/<sensor>/<metric>
-	/*
-		backYard/Lolin8266/sketch
-		backYard/Lolin8266/mac
-		backYard/Lolin8266/ip
-		backYard/Lolin8266/serial
-		backYard/Lolin8266/rssi
-		backYard/Lolin8266/loopCount
-		backYard/Lolin8266/notes
-		backYard/Lolin8266/seesawVersion
-		backYard/Lolin8266/soil/tempC
-		backYard/Lolin8266/soil/moisture
-	*/
 	// Print the signal strength:
 	long rssi = WiFi.RSSI();
 	Serial.print( "WiFi RSSI: " );
@@ -307,32 +387,93 @@ void publishTelemetry()
 	// Prepare a String to hold the JSON.
 	char mqttString[512];
 	// Write the readings to the String in JSON format.
-	snprintf( mqttString, 512, "{\n\t\"sketch\": \"%s\",\n\t\"mac\": \"%s\",\n\t\"ip\": \"%s\",\n\t\"tempC\": %.2f,\n\t\"moisture\": %d,\n\t\"rssi\": %ld,\n\t\"loopCount\": %d,\n\t\"notes\": \"%s\"\n}", sketchName, macAddress, ipAddress, soilTempC, soilCapacitance, rssi, loopCount, notes );
+	snprintf( mqttString, 512, "{\n\t\"sketch\": \"%s\",\n\t\"mac\": \"%s\",\n\t\"ip\": \"%s\",\n\t\"tempC\": %.2f,\n\t\"moisture\": %d,\n\t\"rssi\": %ld,\n\t\"loopCount\": %d,\n\t\"notes\": \"%s\"\n}", sketchName, macAddress, ipAddress, soilTempC, soilMoisture, rssi, loopCount, notes );
 	// Publish the JSON to the MQTT broker.
 	bool success = mqttClient.publish( mqttTopic, mqttString, false );
 	if( success )
 	{
+		Serial.println( "Succsefully published to:" );
 		char buffer[20];
-		// sketchName, macAddress, ipAddress, soilTempC, soilCapacitance, rssi, loopCount, notes
-		mqttClient.publish( "backYard/Lolin8266/sketch", sketchName, false );
-		mqttClient.publish( "backYard/Lolin8266/mac", macAddress, false );
-		mqttClient.publish( "backYard/Lolin8266/ip", ipAddress, false );
-		mqttClient.publish( "backYard/Lolin8266/rssi", ltoa( rssi, buffer, 10 ), false );
-		mqttClient.publish( "backYard/Lolin8266/loopCount", ltoa( loopCount, buffer, 10 ), false );
-		mqttClient.publish( "backYard/Lolin8266/notes", notes, false );
+		// New format: <location>/<device>/<sensor>/<metric>
+		if( mqttClient.publish( sketchTopic, sketchName, false ) )
+			Serial.println( sketchTopic );
+		if( mqttClient.publish( macTopic, macAddress, false ) )
+			Serial.println( macTopic );
+		if( mqttClient.publish( ipTopic, ipAddress, false ) )
+			Serial.println( ipTopic );
+		if( mqttClient.publish( rssiTopic, ltoa( rssi, buffer, 10 ), false ) )
+			Serial.println( rssiTopic );
+		if( mqttClient.publish( loopCountTopic, ltoa( loopCount, buffer, 10 ), false ) )
+			Serial.println( loopCountTopic );
+		if( mqttClient.publish( notesTopic, notes, false ) )
+			Serial.println( notesTopic );
 		dtostrf( soilTempC, 1, 3, buffer );
-		mqttClient.publish( "backYard/Lolin8266/soil/tempC", buffer, false );
-		dtostrf( soilCapacitance, 1, 3, buffer );
-		mqttClient.publish( "backYard/Lolin8266/soil/moisture", buffer, false );
+		if( mqttClient.publish( tempCTopic, buffer, false ) )
+			Serial.println( tempCTopic );
+		if( mqttClient.publish( moistureTopic, ltoa( soilMoisture, buffer, 10 ), false ) )
+			Serial.println( moistureTopic );
 
-		Serial.println( "Successfully published this to the broker:" );
+		Serial.print( "Successfully published to '" );
+		Serial.print( mqttTopic );
+		Serial.println( "', this JSON:" );
 	}
 	else
-		Serial.println( "MQTT publish failed!  Attempted to publish this to the broker:" );
+		Serial.println( "MQTT publish failed!  Attempted to publish this JSON to the broker:" );
 	// Print the JSON to the Serial port.
 	Serial.println( mqttString );
-	lastPublish = millis();
+	lastPublishTime = millis();
 } // End of publishTelemetry() function.
+
+
+/*
+ * runPump() will turn the pump on and off as needed.
+ *
+ * The pump will turn on when:
+ * 	The pump is not currently running.
+ * 	The moisture level is low.
+ * 	It has been off for at least pumpMinOffDelay milliseconds.
+ *
+ * The pump will turn off when:
+ * 	The pump is currently running.
+ * 	The pump has been running for at least pumpRunTime milliseconds.
+ * 	Note that it does not check the moisture level.  This is deliberate.
+ */
+void runPump()
+{
+	unsigned long currentTime = millis();
+
+	// If the soil is dry and the pump is not running.
+	if( !pumpRunning && ( soilMoisture < minMoisture ) )
+	{
+		// If enough time has passed since the pump was shut off (so to give time for water to flow to the sensor).
+		if( currentTime - pumpStopTime > pumpMinOffDelay )
+		{
+			Serial.println( "Starting the pump." );
+			// Note the start time.
+			pumpStartTime = currentTime;
+			// Turn the relay (pump) on.
+			digitalWrite( relayGPIO, HIGH );
+			// Flag that the pump is now running.
+			pumpRunning = true;
+		}
+	}
+
+	// If the pump is currently running.
+	if( pumpRunning )
+	{
+		// If enough time has passed since the pump was started.
+		if( currentTime - pumpStartTime > pumpRunTime )
+		{
+			Serial.println( "Stopping the pump." );
+			// Note the start time.
+			pumpStopTime = currentTime;
+			// Turn the relay (pump) off.
+			digitalWrite( relayGPIO, LOW );
+			// Flag that the pump has stopped.
+			pumpRunning = false;
+		}
+	}
+} // End of runPump() function.
 
 
 void loop()
@@ -346,22 +487,25 @@ void loop()
 	// The loop() function facilitates the receiving of messages and maintains the connection to the broker.
 	mqttClient.loop();
 
+	// Check if the pump should be run.
+	runPump();
+
 	unsigned long time = millis();
-	if( lastPoll == 0 || ( ( time > sensorPollDelay ) && ( time - sensorPollDelay ) > lastPoll ) )
+	if( lastPollTime == 0 || ( ( time > sensorPollDelay ) && ( time - sensorPollDelay ) > lastPollTime ) )
 	{
 		readTelemetry();
 		Serial.print( "Temperature: " );
 		Serial.print( soilTempC );
-		Serial.println("*C" );
-		Serial.print( "Capacitance: " );
-		Serial.println( soilCapacitance );
+		Serial.println(" C" );
+		Serial.print( "Moisture: " );
+		Serial.println( soilMoisture );
 		Serial.println( "" );
-		lastPoll = millis();
+		lastPollTime = millis();
 	}
 
 	time = millis();
 	// When time is less than publishDelay, subtracting publishDelay from time causes an overlow which results in a very large number.
-	if( lastPublish == 0 || ( ( time > publishDelay ) && ( time - publishDelay ) > lastPublish ) )
+	if( lastPublishTime == 0 || ( ( time > publishDelay ) && ( time - publishDelay ) > lastPublishTime ) )
 	{
 		loopCount++;
 		// These next 3 lines act as a "heartbeat", to give local users a visual indication that the system is working.
